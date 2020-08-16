@@ -12,7 +12,7 @@ from django.conf import settings
 region = 'ap-south-1'
 service = 'es'
 
-awsauth = AWS4Auth("AKIAZNK4CM5C2OZ7C274", "IqIlE9itcwGtBe4tdUHiy8xbEDHuOKtrDJjBG3el", region, service)
+
 
 
 ES_CONFIG = {
@@ -87,8 +87,7 @@ class Command(BaseCommand):
             connection_class=RequestsHttpConnection 
         )
 
-        self.dynamo = boto3.client('dynamodb', aws_access_key_id="AKIAZNK4CM5C2OZ7C274",
-                    aws_secret_access_key="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", region_name=region)
+
 
         return ret
 
