@@ -119,3 +119,40 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/2.1/howto/static-files/
 
 STATIC_URL = '/static/'
+
+
+FCM_CONFIG = {
+    "message_url": "https://fcm.googleapis.com/v1/projects/boloindya-1ec98/messages:send"
+    "file_path": "boloindya-1ec98-firebase-adminsdk-ldrqh-27bdfce28b.json",
+    "auth_url": "https://www.googleapis.com/auth/firebase.messaging"
+}
+
+
+LANGUAGE_OPTIONS = (
+    ('1', "English", "en"),
+    ('2', "Hindi", "hi"),
+    ('3', "Tamil", "ta"),
+    ('4', "Telugu", "te"),
+    ('5', "Bengali", "bn"),
+    ('6', "Kannada", "kn"),
+    ('7', "Malayalam", "ml"),
+    ('8', "Gujrati", "gu"),
+    ('9', "Marathi", "mr"),
+    ('10', "Punjabi", "pa"),
+    ('11', "Odia", "or")
+
+)
+
+LANGUAGE_OPTIONS_DICT = {item[0]: item  for item in LANGUAGE_OPTIONS}
+
+
+MAILGUN_CONFIG = {
+    "host": "https://api.mailgun.net/v3/mail.careeranna.com/messages",
+    "token": "d6c66f5dd85b4451bbcbd94cb7406f92-bbbc8336-97426998",
+    "to": ["support@boloindya.com"],
+    "cc": [],
+    "bcc": ["anshika@careeranna.com", "maaz@careeranna.com", "ankit@careeranna.com", 
+            "gitesh@careeranna.com", "tanmai@boloindya.com"],
+    "from": "BoloIndya Support <support@boloindya.com>",
+    "subject": "BoloIndya Report Received | {target} | {reporter_username}"
+}
