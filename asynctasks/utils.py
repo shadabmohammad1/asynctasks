@@ -1,5 +1,5 @@
-from .models import *
-from forum.topic.utils import get_redis_fcm_token
+# from .models import *
+# from forum.topic.utils import get_redis_fcm_token
 from oauth2client.service_account import ServiceAccountCredentials
 import os
 from django.conf import settings
@@ -34,7 +34,7 @@ def _get_access_token():
     return access_token_info.access_token, request_url
 
 
-def get_dynamo_client():
+def get_aws_client(service):
     if settings.AWS_ENDPOINT_URL:
         config = {'endpoint_url': settings.AWS_ENDPOINT_URL}
     else:
@@ -44,7 +44,15 @@ def get_dynamo_client():
             'region_name': settings.AWS_REGION_NAME
         }
 
-    return boto3.client('dynamodb', **config)
+    return boto3.client(service, **config)
+
+
+def get_dynamo_client():
+    return get_aws_client('dynamodb')
+
+
+def get_s3_client():
+    return get_aws_client('s3')
 
 
 def get_weight(key):
@@ -63,9 +71,27 @@ def update_dynamo_entry_count(table_name, attribute, value, key, client=None):
         TableName=table_name,
         Key=key,
         ExpressionAttributeNames={"#A": attribute},
-        UpdateExpression="#A = #A {} {}".format("+" if value >= 0 else "-", abs(value)),
+        UpdateExpression="SET #A = #A {} {}".format("+" if value >= 0 else "-", abs(value)),
         ReturnValues="UPDATED_NEW"
     )
+
+
+def dynamo_query_till_end(**params):
+    last_evaluated_key = None
+    data = []
+
+    while True:
+        params["LastEvaluatedKey"] = last_evaluated_key
+
+        response = get_dynamo_client().query(**params)
+
+        if response.get("Count") == 0:
+            break
+
+        data += response.get("Items")
+        last_evaluated_key = response.get("LastEvaluatedKey")
+
+    return data
 
 
     

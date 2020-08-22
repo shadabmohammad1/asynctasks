@@ -122,7 +122,7 @@ STATIC_URL = '/static/'
 
 
 FCM_CONFIG = {
-    "message_url": "https://fcm.googleapis.com/v1/projects/boloindya-1ec98/messages:send"
+    "message_url": "https://fcm.googleapis.com/v1/projects/boloindya-1ec98/messages:send",
     "file_path": "boloindya-1ec98-firebase-adminsdk-ldrqh-27bdfce28b.json",
     "auth_url": "https://www.googleapis.com/auth/firebase.messaging"
 }

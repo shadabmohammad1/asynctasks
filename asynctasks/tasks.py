@@ -1,13 +1,16 @@
 from __future__ import absolute_import, unicode_literals
 
 import os
+import os.path
 import requests
 import json
 import uuid
+import subprocess
+import boto3
 from datetime import datetime, timedelta
 
 
-from celery_config import app
+from .celery import app
 from celery.utils.log import get_task_logger
 
 
@@ -15,7 +18,7 @@ from django.core.mail import send_mail
 from django.conf import settings
 
 
-from asynctasks.utils import get_weight, get_dynamo_client, update_dynamo_entry_count
+from asynctasks.utils import get_weight, get_dynamo_client, update_dynamo_entry_count, get_s3_client
 
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "settings")
@@ -23,15 +26,23 @@ logger = get_task_logger(__name__)
 
 
 @app.task
-def user_ip_to_state_task(user_id,ip):
-    from forum.user.models import UserProfile
-    import urllib2
-    import json
-    userprofile = UserProfile.objects.filter(pk=user_id)
-    url = 'http://ip-api.com/json/'+ip
-    response = urllib2.urlopen(url).read()
-    json_response = json.loads(response)
-    userprofile.update(state_name = json_response['regionName'],city_name = json_response['city'])
+def user_ip_to_state_task(user_id, ip):
+    response = requests.get("http://ip-api.com/json/%s"%ip)
+
+    if not response.ok:
+        return
+
+    data = json.loads(response.text)
+
+    get_dynamo_client().update_item(
+            TableName='User',
+            Key={'id': {'S': user_id}},
+            ExpressionAttributeValues={
+                ':region': {'S': data.get('regionName')},
+                ':city': {'S': data.get('city')}
+            },
+            KeyConditionExpression='SET state_name = :region, city_name = :city'
+        )
 
 
 def ffmpeg(*cmd):
@@ -41,66 +52,90 @@ def ffmpeg(*cmd):
         return False
     return True
 
-def upload_media(media_file,filename):
-    try:
-        client = boto3.client('s3',aws_access_key_id = settings.BOLOINDYA_AWS_ACCESS_KEY_ID,aws_secret_access_key = settings.BOLOINDYA_AWS_SECRET_ACCESS_KEY)
-        filenameNext= str(filename).split('.')
-        final_filename = str(filenameNext[0])+"."+str(filenameNext[1])
-        client.put_object(Bucket=settings.BOLOINDYA_AWS_BUCKET_NAME, Key='watermark/' + final_filename, Body=media_file,ACL='public-read')
-        filepath = "https://s3.amazonaws.com/"+settings.BOLOINDYA_AWS_BUCKET_NAME+"/watermark/"+final_filename
-        return filepath
-    except:
-        return None
 
-def create_downloaded_url(topic_id):
-    import subprocess
-    import os.path
-    from datetime import datetime
-    import os
-    import boto3
-    from django.conf import settings
-    from forum.topic.models import Topic
-    video_byte = Topic.objects.get(pk=topic_id)
-    try:
-        # print "start time: ", datetime.now()
-        filename_temp = "temp_"+video_byte.backup_url.split('/')[-1]
-        filename = video_byte.backup_url.split('/')[-1]
-        cmd = ['ffmpeg','-i', video_byte.backup_url, '-vf',"[in]scale=540:-1,drawtext=text='@"+video_byte.user.username+"':x=10:y=H-th-20:fontsize=18:fontcolor=white[out]",settings.PROJECT_PATH+"/boloindya/scripts/watermark/"+filename_temp]
-        ps = subprocess.Popen(cmd, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
-        (output, stderr) = ps.communicate()
-        cmd = 'ffmpeg -i '+settings.PROJECT_PATH+"/boloindya/scripts/watermark/"+filename_temp+' -ignore_loop 0 -i '+settings.PROJECT_PATH+"/boloindya/media/img/boloindya_white.gif"+' -filter_complex "[1:v]format=yuva444p,scale=140:140,setsar=1,rotate=0:c=white@0:ow=rotw(0):oh=roth(0) [rotate];[0:v][rotate] overlay=10:(main_h-overlay_h+10):shortest=1" -codec:a copy -y '+settings.PROJECT_PATH+"/boloindya/scripts/watermark/"+filename
-        subprocess.call(cmd,shell=True)
-        downloaded_url = upload_media(open(settings.PROJECT_PATH+"/boloindya/scripts/watermark/"+filename),filename)
-        if downloaded_url:
-            Topic.objects.filter(pk=video_byte.id).update(downloaded_url = downloaded_url,has_downloaded_url = True)
-        if os.path.exists(settings.PROJECT_PATH+"/boloindya/scripts/watermark/"+filename):
-            os.remove(settings.PROJECT_PATH+"/boloindya/scripts/watermark/"+filename_temp)
-            os.remove(settings.PROJECT_PATH+"/boloindya/scripts/watermark/"+filename)
-        # print "bye"
-        # print "End time:  ",datetime.now()
-    except Exception as e:
-        try:
-            os.remove(settings.PROJECT_PATH+"/boloindya/scripts/watermark/"+filename_temp)
-        except:
-            pass
-        try:
-            os.remove(settings.PROJECT_PATH+"/boloindya/scripts/watermark/"+filename)
-        except:
-            pass
-        # print e
+def upload_media(media_file,filename):
+    filenameNext = str(filename).split('.')
+    final_filename = str(filenameNext[0])+"."+str(filenameNext[1])
+
+    get_s3_client().put_object(Bucket=settings.BOLOINDYA_AWS_BUCKET_NAME, 
+            Key='watermark/' + final_filename, Body=media_file, ACL='public-read')
+
+    filepath = 'https://s3.amazonaws.com/'+settings.BOLOINDYA_AWS_BUCKET_NAME+'/watermark/'+final_filename
+    return filepath
+
+
+def create_downloaded_url(vb_id):
+    dynamo_client = get_dynamo_client()
+    video_byte = dynamo_client.get_item(TableName='VideoByte', Key={'id': {'S': vb_id}}).get('Item')
+    vb_user = dynamo_client.get_item(TableName='User', Key={'id': {'S': video_byte.get('user_id').get('S')}}).get('Item')
+
+    backup_url = video_byte.get('backup_url').get('S')
+
+    filename_temp = 'temp_' + backup_url.split('/')[-1]
+    filename = backup_url.split('/')[-1]
+
+    cmd = ['ffmpeg', '-i', backup_url, '-vf',
+                "[in]scale=540:-1,drawtext=text='@" + vb_user.get("username").get("S") +"':x=10:y=H-th-20:fontsize=18:fontcolor=white[out]",
+                settings.PROJECT_PATH+"/boloindya/scripts/watermark/"+filename_temp]
+
+    ps = subprocess.Popen(cmd, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+    (output, stderr) = ps.communicate()
+
+    cmd = ''.join(['ffmpeg -i ', settings.PROJECT_PATH, '/boloindya/scripts/watermark/', 
+                filename_temp, ' -ignore_loop 0 -i ', settings.PROJECT_PATH, 
+                '/boloindya/media/img/boloindya_white.gif', 
+                ' -filter_complex "[1:v]format=yuva444p,scale=140:140,setsar=1,rotate=0:c=white@0:ow=rotw(0):oh=roth(0) [rotate];[0:v][rotate] overlay=10:(main_h-overlay_h+10):shortest=1" -codec:a copy -y ', 
+                settings.PROJECT_PATH, '/boloindya/scripts/watermark/', filename ])
+
+    subprocess.call(cmd,shell=True)
+    downloaded_url = upload_media(open(os.path.join(settings.PROJECT_PATH, 'boloindya/scripts/watermark', filename)),filename)
+
+    dynamo_client.update_item(
+            TableName='VideoByte',
+            ExpressionAttributeValues={':du': {'S': downloaded_url}, ':idu': {'BOOL': True}},
+            Key={'id': {'S': vb_id}}
+        )
+
+    main_file_path = os.path.join(settings.PROJECT_PATH, 'boloindya/scripts/watermark', filename)
+    temp_file_path = os.path.join(settings.PROJECT_PATH, 'boloindya/scripts/watermark', filename_temp)
+
+    if os.path.exists(main_file_path):
+        os.remove(main_file_path)
+        os.remove(temp_file_path)
+
 
 @app.task
 def sync_contacts_with_user(user_id):
-    from forum.user.models import UserProfile,UserPhoneBook,Contact
-    try:
-        user_phonebook = UserPhoneBook.objects.using('default').get(user_id=user_id)
-        all_contact_no = list(user_phonebook.contact.all().values_list('contact_number',flat=True))
-        all_userprofile = UserProfile.objects.filter(mobile_no__in=all_contact_no,user__is_active=True).values('mobile_no','user_id')
-        if all_userprofile:
-            for each_userprofile in all_userprofile:
-                Contact.objects.filter(contact_number=each_userprofile['mobile_no']).update(is_user_registered=True,user_id=each_userprofile['user_id'])
-    except:
-        pass # No phonebook exist for user
+    dynamo_client = get_dynamo_client()
+
+    user_contacts = dynamo_query_till_end(
+            TableName='UserPhoneBook',
+            ExpressionAttributeValues={':u': {'S': user_id}},
+            KeyConditionExpression=' user_id = :u '
+        )
+
+    user_contact_map = {contact.get('mobile_number'): contact for contact in user_contacts}
+
+    for user in dynamo_query_till_end(
+                    TableName='User',
+                    IndexName='mobile_no_index',
+                    ExpressionAttributeValues={':ml': [contact.get('contact_number') for contact in user_contacts]},
+                    KeyConditionExpression=' mobile_no IN :ml ',
+                    AttributesToGet=['id', 'mobile_no']
+                ):
+
+        if not user.get('is_active'):
+            continue
+
+        contact = user_contact_map.get(user.get('mobile_no').get('S'))
+
+        dynamo_client.update_item(
+                TableName='Contact',
+                Key={'user_id': {'S': contact.get('user_id').get('S')}, 'contact_id': {contact.get('id').get('S')}},
+                ExpressionAttributeValues={':iru': {'BOOL': True}},
+                UpdateExpression='SET is_user_registered = :iru'
+            )
+
 
 @app.task
 def cache_follow_post(user_id):
@@ -171,38 +206,53 @@ def create_comment_notification(created,instance_id):
         # print e
         pass
 
-from HTMLParser import HTMLParser
-class MLStripper(HTMLParser):
-    def __init__(self):
-        self.reset()
-        self.fed = []
-    def handle_data(self, d):
-        self.fed.append(d)
-    def get_data(self):
-        return ''.join(self.fed)
+# from HTMLParser import HTMLParser
+# class MLStripper(HTMLParser):
+#     def __init__(self):
+#         self.reset()
+#         self.fed = []
+#     def handle_data(self, d):
+#         self.fed.append(d)
+#     def get_data(self):
+#         return ''.join(self.fed)
 
 def strip_tags(html):
     s = MLStripper()
     s.feed(html)
     return s.get_data()
 
-def get_mentions_and_send_notification(comment_obj):
-    from django.contrib.auth.models import User
-    from forum.topic.models import Notification
-    comment = strip_tags(comment_obj.comment)
-    mention_tag=[mention for mention in comment.split() if mention.startswith("@")]
+def get_mentions_and_send_notification(comment_id):
+    dynamo_client = get_dynamo_client()
+
+    comment = dynamo_client.get_item(TableName='Comment', Key={'id': {'S': comment_id}}).get('Item')
+    comment_text = strip_tags(comment.get('comment').get('S'))
+    mention_tag = [mention for mention in comment_text.split() if mention.startswith("@")]
     user_ids = []
-    if mention_tag:
-        for each_mention in mention_tag:
-            try:
-                user = User.objects.get(username=each_mention.strip('@'))
-                user_ids.append(user.id)
-                if not user == comment_obj.user:
-                    notify_mention = Notification.objects.create(for_user = user  ,topic = comment_obj,notification_type='10',user = comment_obj.user)
-            except Exception as e:
-                # print e
-                pass
+
+    for mention in mention_tag:
+        user = dynamo_client.get_item(
+                TableName='User',
+                IndexName='username_index',
+                Key={'username': {'S': mention.strip('@')}}
+            ).get('Item')
+
+        if user.get('id').get('S') == comment.get('user_id').get('S'):
+            continue
+
+        dynamo_client.put_item(
+                TableName='Notification',
+                Item={
+                    'for_user_id': {'S': comment.get('user_id').get('S')},
+                    'notification_type': {'S': '10'},
+                    'user_id': {'S': user.get('id').get('S')},
+                    'video_byte_id': comment_id
+                }
+            )
+
+        user_ids.append(user.get('id').get('S'))
+
     return user_ids
+
  
 @app.task
 def create_hash_view_count(create,instance_id):
@@ -249,43 +299,43 @@ def create_thumbnail_cloudfront(topic_id):
 def send_report_mail(report_id):
     dynamo_client = get_dynamo_client()
 
-    report = dynamo_client.get_item(TableName="Report", Key={"id": {"S": report_id}}).get("Item")
+    report = dynamo_client.get_item(TableName='Report', Key={'id': {'S': report_id}}).get('Item')
 
-    reporter = dynamo_client.get_item(TableName="User", 
-                    Key={"id": {"S": report.get("reported_by_id").get("S")}}).get("Item")
+    reporter = dynamo_client.get_item(TableName='User', 
+                    Key={'id': {'S': report.get('reported_by_id').get('S')}}).get('Item')
 
     video_byte = dynamo_client.get_item(
-            TableName="VideoByte", Key={"id": {"S": report.get("topic_id").get("S")}}).get("Item")
+            TableName='VideoByte', Key={'id': {'S': report.get('topic_id').get('S')}}).get('Item')
 
-    if report.get("target_type").get("S") == "User":
-        target_user_id = report.get("target_id").get("S")
+    if report.get('target_type').get('S') == 'User':
+        target_user_id = report.get('target_id').get('S')
     else:
-        target_user_id = dynamo_client.get_item(TableName=report.get("target_type"),
-                Key={"id": {"S": report.get("target_id").get("S")}}).get("Item").get("user_id").get("S")
+        target_user_id = dynamo_client.get_item(TableName=report.get('target_type'),
+                Key={'id': {'S': report.get('target_id').get('S')}}).get('Item').get('user_id').get('S')
 
-    target_user = dynamo_client.get_item(TableName="User", Key={"id": {"S": target_user_id}}).get("Item")
+    target_user = dynamo_client.get_item(TableName='User', Key={'id': {'S': target_user_id}}).get('Item')
 
-    mail_message = render_to_string("report_email.html", context={
-            "reported_by_username": reporter.get("username").get("S"),
-            "reported_by_name": reporter.get("name").get("S"),
-            "video_title": video_byte.get("title").get("S"),
-            "video_id": video_byte.get("id").get("S"),
-            "report_type": report.get("report_type").get("S"),
-            "target_mobile": target_user.get("mobile_no").get("S"),
-            "target_email": target_user.get("email").get("S")
+    mail_message = render_to_string('report_email.html', context={
+            'reported_by_username': reporter.get('username').get('S'),
+            'reported_by_name': reporter.get('name').get('S'),
+            'video_title': video_byte.get('title').get('S'),
+            'video_id': video_byte.get('id').get('S'),
+            'report_type': report.get('report_type').get('S'),
+            'target_mobile': target_user.get('mobile_no').get('S'),
+            'target_email': target_user.get('email').get('S')
         })
 
     requests.post(
-            settings.MAILGUN_CONFIG.get("host"),
-            auth={"api": settings.MAILGUN_CONFIG.get("token")},
+            settings.MAILGUN_CONFIG.get('host'),
+            auth={'api': settings.MAILGUN_CONFIG.get('token')},
             data={
-                "from": settings.MAILGUN_CONFIG.get("from"),
-                "to": settings.MAILGUN_CONFIG.get("to"),
-                "cc": settings.MAILGUN_CONFIG.get("cc"),
-                "bcc": settings.MAILGUN_CONFIG.get("bcc"),
-                "subject": settings.MAILGUN_CONFIG.get("subject").format(target=report.get("target_type"), 
-                                reporter_username=reporter.get("username").get("S")),
-                "html": mail_message
+                'from': settings.MAILGUN_CONFIG.get('from'),
+                'to': settings.MAILGUN_CONFIG.get('to'),
+                'cc': settings.MAILGUN_CONFIG.get('cc'),
+                'bcc': settings.MAILGUN_CONFIG.get('bcc'),
+                'subject': settings.MAILGUN_CONFIG.get('subject').format(target=report.get('target_type'), 
+                                reporter_username=reporter.get('username').get('S')),
+                'html': mail_message
             }
         )
 
@@ -300,50 +350,50 @@ def add_to_history(user_id, score, action, action_object_type, action_object_id,
 
     while True:
         result = dynamo_client.query(
-            TableName="BoloActionHistory",
-            IndexName="user_action_index",
-            ExpressionAttributeValues={":u": {"S": user_id}, ":a": {"S": action}},
-            KeyConditionExpression="user_id = :u and action = :a",
+            TableName='BoloActionHistory',
+            IndexName='user_action_index',
+            ExpressionAttributeValues={':u': {'S': user_id}, ':a': {'S': action}},
+            KeyConditionExpression='user_id = :u and action = :a',
             LastEvaluatedKey=last_evaluated_key,
-            AttributesToGet=["action_object_type", "action_object_id", "id"]
+            AttributesToGet=['action_object_type', 'action_object_id', 'id']
         )
 
-        if result.get("Count") == 0:
+        if result.get('Count') == 0:
             break
 
-        history = filter(lambda x: x.get("action_object_type").get("S") == action_object_type  \
-                    x.get("action_object_id").get("S") == action_object_id, result.get("Items"))
+        history = filter(lambda x: x.get('action_object_type').get('S') == action_object_type and \
+                    x.get('action_object_id').get('S') == action_object_id, result.get('Items'))
 
         if len(history):
             history = history[0]
             break
 
-        last_evaluated_key = result.get("LastEvaluatedKey")
+        last_evaluated_key = result.get('LastEvaluatedKey')
 
     if history:
         dynamo_client.update_item(
-            TableName="BoloActionHistory",
-            ExpressionAttributeNames={"#R": "is_removed"},
-            ExpressionAttributeValues={":r": {"N": 1 if is_removed else 0}}
-            Key={"id": {"S": history.get("id").get("S")}},
-            UpdateExpression="SET #R = :r",
-            ReturnValues="NONE"
+            TableName='BoloActionHistory',
+            ExpressionAttributeNames={'#R': 'is_removed'},
+            ExpressionAttributeValues={':r': {'N': 1 if is_removed else 0}},
+            Key={'id': {'S': history.get('id').get('S')}},
+            UpdateExpression='SET #R = :r',
+            ReturnValues='NONE'
         )
     else:
         dynamo_client.put_item(
-            TableName="BoloActionHistory",
+            TableName='BoloActionHistory',
             Item={
-                "id": str(uuid.uuid4()),
-                "created_at": str(datetime.now()),
-                "last_modified_at": str(datetime.now()),
-                "user_id": user_id,
-                "score": score,
-                "action": action,
-                "action_object_type": action_object_type,
-                "action_object_id": action_object_id,
-                "is_removed": 1 if is_removed else 0,
-                "is_encashed": 0,
-                "is_eligible_for_encash": 1
+                'id': str(uuid.uuid4()),
+                'created_at': str(datetime.now()),
+                'last_modified_at': str(datetime.now()),
+                'user_id': user_id,
+                'score': score,
+                'action': action,
+                'action_object_type': action_object_type,
+                'action_object_id': action_object_id,
+                'is_removed': 1 if is_removed else 0,
+                'is_encashed': 0,
+                'is_eligible_for_encash': 1
             }
         )
 
@@ -355,21 +405,21 @@ def add_bolo_score(user_id, feature, action_object_type, action_object_id):
     if not score:
         return
 
-    update_dynamo_entry_count("User", bolo_score, int(score), {"id": {"S": user_id}}, dynamo_client)
+    update_dynamo_entry_count('User', bolo_score, int(score), {'id': {'S': user_id}}, dynamo_client)
     add_to_history(user_id, score, feature, action_object_type, action_object_id, False)
 
-    if feature in ["create_topic", "create_topic_en"]:
+    if feature in ['create_topic', 'create_topic_en']:
         dynamo_client.put_item(
-            TableName="Notification",
+            TableName='Notification',
             Item={
-                "id": str(uuid.uuid4())
-                "created_at": str(datetime.now()),
-                "last_modified_at": str(datetime.now())
-                "for_user_id": user_id,
-                "video_byte_type": action_object_type,
-                "video_byte_id": action_object_id,
-                "notification_type": "8",
-                "user_id": user_id
+                'id': str(uuid.uuid4()),
+                'created_at': str(datetime.now()),
+                'last_modified_at': str(datetime.now()),
+                'for_user_id': user_id,
+                'video_byte_type': action_object_type,
+                'video_byte_id': action_object_id,
+                'notification_type': '8',
+                'user_id': user_id
             }
         )
 
@@ -378,50 +428,50 @@ def add_bolo_score(user_id, feature, action_object_type, action_object_id):
 def default_boloindya_follow(user_id, language):
     dynamo_client = get_dynamo_client()
 
-    user = dynamo_client.get_item(TableName="User", Key={"id": {"S": user_id}}).get("Item")
+    user = dynamo_client.get_item(TableName='User', Key={'id': {'S': user_id}}).get('Item')
 
     language_name = settings.LANGUAGE_OPTIONS_DICT.get(language)
-    boloindya_username = "boloindya_%s"%language_name.lower() if language_name else "boloindya"
+    boloindya_username = 'boloindya_%s'%language_name.lower() if language_name else 'boloindya'
 
     boloindya_user = dynamo_client.query(
-        TableName="User",
-        IndexName="username_index",
-        AttributesToGet=["id", "username"],
-        ExpressionAttributeValues={":username": {"S": boloindya_username}},
-        KeyConditionExpression="username = :username"
-    ).get("Items")[0]
+        TableName='User',
+        IndexName='username_index',
+        AttributesToGet=['id', 'username'],
+        ExpressionAttributeValues={':username': {'S': boloindya_username}},
+        KeyConditionExpression='username = :username'
+    ).get('Items')[0]
 
     try:
         follow = dynamo_client.update_item(
-            TableName="Follow",
-            ExpressionAttributeNames={"#A": "is_active"},
-            ExpressionAttributeValues={":a": {"N": 1}},
+            TableName='Follow',
+            ExpressionAttributeNames={'#A': 'is_active'},
+            ExpressionAttributeValues={':a': {'N': 1}},
             Key={
-                "user_id": {"S": boloindya_user.get("id").get("S")},
-                "follower_id": {"S": user_id}
+                'user_id': {'S': boloindya_user.get('id').get('S')},
+                'follower_id': {'S': user_id}
             },
-            UpdateExpression="SET #A = :a",
-            ReturnValues="UPDATED_NEW"
+            UpdateExpression='SET #A = :a',
+            ReturnValues='UPDATED_NEW'
         )
 
     except Exception as e:
         follow = dynamo_client.put_item(
-            TableName="Follow",
+            TableName='Follow',
             Item={
-                "user_id": {"S": boloindya_user.get("id").get("S")},
-                "follower_id": {"S": user_id},
-                "is_active": {"N", 1},
-                "created_at": {"S", str(datetime.now())},
-                "last_modified_at": {"S", str(datetime.now())}
+                'user_id': {'S': boloindya_user.get('id').get('S')},
+                'follower_id': {'S': user_id},
+                'is_active': {'N', 1},
+                'created_at': {'S', str(datetime.now())},
+                'last_modified_at': {'S', str(datetime.now())}
             },
-            ReturnValues="UPDATED_NEW"
-        ).get("Attributes")
+            ReturnValues='UPDATED_NEW'
+        ).get('Attributes')
 
         add_bolo_score(user_id, 'follow', 'Follow', 
-                "%s:%s"%(follow.get("user_id").get("S"), follow.get("follower_id").get("S")))
+                '%s:%s'%(follow.get('user_id').get('S'), follow.get('follower_id').get('S')))
 
-    update_dynamo_entry_count("User", "follow_count", 1, {"id": {"S": user_id}}, dynamo_client)
-    update_dynamo_entry_count("User", "follower_count", 1, {"id": {"S": follow.get("follower_id").get("S")}}, dynamo_client)
+    update_dynamo_entry_count('User', 'follow_count', 1, {'id': {'S': user_id}}, dynamo_client)
+    update_dynamo_entry_count('User', 'follower_count', 1, {'id': {'S': follow.get('follower_id').get('S')}}, dynamo_client)
 
     #To do: Update these functions too
     update_redis_following(user.id, bolo_indya_user.id,True)
@@ -438,37 +488,36 @@ def send_upload_video_notification(data):
         'Content-Type': 'application/json; UTF-8' }
 
     devices = get_dynamo_client().query(
-                TableName="FCMDevice", 
-                IndexName="user_install_index",
-                AttributesToGet=["user_id", "is_uninstalled", "reg_id"],
+                TableName='FCMDevice', 
+                IndexName='user_install_index',
+                AttributesToGet=['user_id', 'is_uninstalled', 'reg_id'],
                 ExpressionAttributeValues={
-                    ":user_id": {"S": data.get("particular_user_id", None)},
-                    ":is_uninstalled": {"N": 0}
+                    ':user_id': {'S': data.get('particular_user_id', None)},
+                    ':is_uninstalled': {'N': 0}
                 },  
-                KeyConditionExpression="user_id = :user_id and is_uninstalled  = :is_uninstalled"
+                KeyConditionExpression='user_id = :user_id and is_uninstalled  = :is_uninstalled'
             )
 
-    for device in devices.get("Items"):
+    for device in devices.get('Items'):
         fcm_message = {
-            "message": {
-                "token": device.get("reg_id"),
-                "data": {
-                    "title_upper": data.get("upper_title", ""), 
-                    "title": data.get("title", ""), 
-                    "id": data.get("id", ""), 
-                    "type": data.get("notification_type", ""),
-                    "notification_id": "-1", 
-                    "image_url": data.get("image_url", "")
+            'message': {
+                'token': device.get('reg_id'),
+                'data': {
+                    'title_upper': data.get('upper_title', ''), 
+                    'title': data.get('title', ''), 
+                    'id': data.get('id', ''), 
+                    'type': data.get('notification_type', ''),
+                    'notification_id': '-1', 
+                    'image_url': data.get('image_url', '')
                 }
             }
         }
 
         response = requests.post(
-            settings.FCM_CONFIG.get("message_url"), 
+            settings.FCM_CONFIG.get('message_url'), 
             data=json.dumps(fcm_message), 
             headers=headers
         )
-
 
 if __name__ == '__main__':
     app.start()
