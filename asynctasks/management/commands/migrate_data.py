@@ -16,7 +16,7 @@ from asynctasks.celery import app
 
 
 from .data_migration_config import config
-
+from .rebuild_es_index import Command as ESCommand
 
 redis_client = redis.Redis(**config.get('redis_config'))
 dynamo_client = boto3.client('dynamodb', **config.get('dynamo_config'))
@@ -28,6 +28,7 @@ ALLOWED_THREADS = 10
 
 
 redis_client.set('migration_threads', 0)
+lock = redis_client.lock('migration_lock')
 
 
 class Command(BaseCommand):
@@ -106,9 +107,7 @@ class Command(BaseCommand):
             if not table_info.get('is_active'):
                 continue
 
-            lock = redis_client.lock('migration_lock')
             lock.acquire(blocking=True)
-
 
             self.check_for_migrate_column(_cr, table_info.get('rds_table_name'))
 
@@ -140,7 +139,7 @@ class Command(BaseCommand):
                 res = group(run_thread.s("%s ::"%i, segments_partition[i], segments_partition[i+1],
                     table_info, dynamo_table_key_attr) for i in range(0, len(segments_partition)-1))()
 
-            lock.release()
+            # lock.release()
 
 
         print("Total time = ", time() - t)
@@ -167,13 +166,15 @@ class Command(BaseCommand):
             columns_list = [d.name for d in _cr.description]
 
             dynamo_item_list = []
+            es_doc_list = []
             redis_items = {}
             migrated_ids = []
             is_data_processed = False
 
             for row in _cr.fetchall():
-                dynamo_item = self.get_formatted_item(columns_list, dynamo_table_key_attr, 
-                                    row, table_info.get('redis_get_list', []))
+                row_data = dict(zip(columns_list, row))
+                dynamo_item = self.get_formatted_item(row_data, dynamo_table_key_attr, 
+                                    table_info.get('redis_get_list', []))
                 dynamo_item_list.append(dynamo_item)
                 item = dynamo_item.get('PutRequest').get('Item')
 
@@ -183,20 +184,33 @@ class Command(BaseCommand):
                     updated_value = list(item.get(redis_save.get('assign')).values())[0]
                     redis_items[prefix + rds_value] = updated_value
 
+                if table_info.get('elasticsearch'):
+                    _doc = {}
+
+                    for key in table_info.get('elasticsearch').get('keys'):
+                        _doc[key] = row_data.get(key)
+
+                    _doc['id'] = list(item.get('id').values())[0]
+
+                    es_doc_list.append(_doc)
+
                 is_data_processed = True
                 migrated_ids.append(row[0])
 
             if not is_data_processed:
                 break
 
-            print(json.dumps(dynamo_item_list, indent=3))
-            self.migrate_by_threading(dynamo_item_list, table_info)
+            ESCommand().bulk_insert_doc(es_doc_list, table_info.get('elasticsearch').get('index'))
 
-            if redis_items:
-                redis_client.mset(redis_items)
 
-            _cr.execute("UPDATE " + table_info.get('rds_table_name') + " SET is_migrated = true WHERE id in %s", 
-                [tuple(migrated_ids)])
+            # self.migrate_by_threading(dynamo_item_list, table_info)
+
+            # if redis_items:
+            #     redis_client.mset(redis_items)
+
+            # _cr.execute("UPDATE " + table_info.get('rds_table_name') + " SET is_migrated = true WHERE id in %s", 
+            #     [tuple(migrated_ids)])
+            break
 
         print(" time = %s"%(time() - t))
 
@@ -227,11 +241,10 @@ class Command(BaseCommand):
                 thread.start()
 
 
-    def get_formatted_item(self, columns_list, dynamo_table_key_attr, row, redis_get_list=[]):
+    def get_formatted_item(self, row_data, dynamo_table_key_attr, redis_get_list=[]):
         _dict = {}
 
-        for i, val in enumerate(row):
-            key = columns_list[i]
+        for key, val in row_data.items():
 
             if key == 'is_migrated':
                 continue
@@ -285,4 +298,10 @@ def run_dynamo_batch_write_thread(dynamo_table_name, item_list, rds_table_name):
         start_index, end_index = end_index, end_index + DYNAMO_BATCH_SIZE
 
     print("%s Item updated"%item_list_length)
-    redis_client.set('migration_threads', int(redis_client.get('migration_threads').decode()) -1)
+
+    running_threads = int(redis_client.get('migration_threads').decode())
+
+    if running_threads <= 1:
+        lock.release()
+    else:
+        redis_client.set('migration_threads', running_threads - 1)

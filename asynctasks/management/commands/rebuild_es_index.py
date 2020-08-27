@@ -1,8 +1,9 @@
 
 
+import boto3
+import json
 from elasticsearch import Elasticsearch, RequestsHttpConnection, helpers 
 from requests_aws4auth import AWS4Auth 
-import boto3
 
 
 from django.core.management.base import BaseCommand, CommandError
@@ -13,65 +14,96 @@ region = 'ap-south-1'
 service = 'es'
 
 
-
-
 ES_CONFIG = {
     'host': 'search-boloindya-test-6ocsxdnqobqjfug2yb5c5w46ny.ap-south-1.es.amazonaws.com',
     'indices': [{
         'name': 'user-index',
         'table': 'User',
-        'config': {
-            "settings" : {
-                "number_of_shards": 2,
-                "number_of_replicas": 1,
-                "analysis": {
-                    "analyzer": {
-                        "trigram": {
-                            "type": "custom",
-                            "tokenizer": "standard",
-                            "filter": ["lowercase","shingle"]
-                        },
-                        "reverse": {
-                            "type": "custom",
-                            "tokenizer": "standard",
-                            "filter": ["lowercase","reverse"]
-                        }
-                    },
-                    "filter": {
-                        "shingle": {
-                            "type": "shingle",
-                            "min_shingle_size": 2,
-                            "max_shingle_size": 4
-                        }
-                    }
-                }
+        'index-config': {
+            'settings' : {
+                'number_of_shards': 2,
+                'number_of_replicas': 1
             },
-            'mappings': {
+            'mapping': {
                 'properties': {
-                    'term': {
-                            'type': 'text',
-                            'fields': {
-                                'trigram': {
-                                'type': 'text',
-                                'analyzer': 'trigram'
-                            },
-                            'reverse': {
-                                'type': 'text',
-                                'analyzer': 'reverse'
-                            }
-                        }
-                    },
                     'name': {'type': 'text'},
-                    'create_date': {'format': 'dateOptionalTime', 'type': 'date'},
-                    'username': {'type': 'text'},
-                    'email': {'type': 'text'},
-                }}
+                    'username': {'type': 'keyword'},
+                    'is_active': {'type': 'integer'},
+                    'is_popular': {'type': 'integer'},
+                    'joined_date': {'type': 'date'},
+                    'follower_count': {'type': 'integer'}
+                }
+            }      
         },
-        'doc_config': {
-            'term_fields': ['name', 'username', 'email'],
-            'id_field': 'id',
-            'extra_fields': ['name', 'username']
+    },{
+        'name': 'vb-seen-index',
+        'table': 'VBSeen',
+        'index-config': {
+            'settings': {
+                'number_of_shards': 2,
+                'number_of_replicas': 1
+            },
+            'mapping': {
+                'properties': {
+                    'user_id': {'type': 'keyword'},
+                    'video_id': {'type': 'keyword'},
+                    'created_at': {'type': 'date'}
+                }
+            }
         }
+    },{
+        'name': 'fvb-seen-index',
+        'table': 'FVBSeen',
+        'index-config': {
+            'settings': {
+                'number_of_shards': 2,
+                'number_of_replicas': 1
+            },
+            'mapping': {
+                'properties': {
+                    'video_id': {'type': 'keyword'},
+                    'view_count': {'type': 'integer'},
+                    'created_at': {'type': 'date'}
+                }
+            }
+        }
+    },{
+        'name': 'video-playtime-index',
+        'table': 'VideoPlaytime',
+        'index-config': {
+            'settings': {
+                'number_of_shards': 2,
+                'number_of_replicas': 1
+            },
+            'mapping': {
+                'properties': {
+                    'user_id': {'type': 'keyword'},
+                    'video_id': {'type': 'keyword'},
+                    'playtime': {'type': 'float'},
+                    'timestamp': {'type': 'date'}
+                }
+            }
+        }
+    },{
+        'name': 'hashtag-index',
+        'table': 'Hashtag',
+        'index-config': {
+            'settings': {
+                'number_of_shards': 2,
+                'number_of_replicas': 1
+            },
+            'mapping': {
+                'properties': {
+                    'hashtag': {'type': 'keyword'},
+                    'hashtag_id': {'type': 'keyword'},
+                    'is_popular': {'type': 'boolean'},
+                    'is_blocked': {'type': 'boolean'},
+                    'total_views': {'type': 'integer'},
+                    'popular_date': {'type': 'date'},
+                    'hash_counter': {'type': 'integer'}
+                }
+            }
+        }  
     }]
 }
 
@@ -79,6 +111,10 @@ ES_CONFIG = {
 class Command(BaseCommand):
     def __init__(self, *args, **kwargs):
         ret = super().__init__(*args, **kwargs)
+
+        credentials = boto3.Session().get_credentials()
+        awsauth = AWS4Auth(credentials.access_key, credentials.secret_key, region, service)
+
         self.es = Elasticsearch( 
             hosts=[{'host': ES_CONFIG.get('host'), 'port': 443}], 
             http_auth=awsauth, 
@@ -87,41 +123,14 @@ class Command(BaseCommand):
             connection_class=RequestsHttpConnection 
         )
 
-
-
         return ret
 
 
     def handle(self, *args, **options):
-        # for index in ES_CONFIG.get('indices'):
-        #     self.recreate_index(index)
-        #     docs = self.get_processed_doc(index)
-
-        #     print(helpers.bulk(self.es, docs))
-
-        print(self.es.search(index="user-index", body={"query": {"match": {"term": "maaz" }}}))
-
-        print(self.es.search(index="user-index", body={
-            "suggest" : {
-                "text" : "maaz azmi",
-                "simple_phrase" : {
-                    "phrase" : {
-                        "field": "term.trigram",
-                        "direct_generator": [ {
-                            "field": "title.trigram",
-                            "suggest_mode": "always"
-                        } ],
-                        # "size": 4,
-                        # "gram_size": 4,
-                        # "highlight": {
-                        #     "pre_tag": "<em>",
-                        #     "post_tag": "</em>"
-                        # }
-                    }
-                }
-            }
-        }))
-
+        for index in ES_CONFIG.get('indices'):
+            self.recreate_index(index)
+        
+        
         
     def recreate_index(self, index):
         if self.es.indices.exists(index.get('name')):
@@ -132,9 +141,16 @@ class Command(BaseCommand):
         self.es.indices.create(index=index.get('name'), body=index.get('config'))
         print("===== Index %s created successfully."%index.get('name'))
         
+
+    def bulk_insert_doc(self, doc_list, index_name):
+        bulk_body = []
+
+        for doc in doc_list:
+            bulk_body.append({'index': {'_index': index_name, '_id': doc.pop('id')}})
+            bulk_body.append(doc)
             
-
-
+        print(self.es.bulk(body=bulk_body, headers={"Content-Type": "application/x-ndjson"}))
+            
 
     def get_processed_doc(self, index):
         table = index.get('table')
