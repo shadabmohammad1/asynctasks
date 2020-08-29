@@ -33,7 +33,7 @@ config = {
                 'key': 'rds_id',
                 'assign': 'id'
             }],
-        'is_active': True,
+        'is_active': False,
         'elasticsearch': {
             'keys': ['id', 'name', 'username', 'email', 'is_popular', 'is_active', 
                         'date_joined', 'follower_count'],
@@ -66,6 +66,108 @@ config = {
         'rds_table_name': 'forum_user_weight',
         'dynamo_table_name': 'Weight',
         'is_active': False
+    }, {
+        'rds_query': {
+            'select': 'id, id as rds_id, title, slug, description, is_closed, is_removed, is_private, parent_id, is_global, color, reindex_at, category_image, order_no, is_engagement, view_count, dark_category_image',
+            'from': 'forum_category_category',
+            'where': 'true',
+        },
+        'rds_table_name': 'forum_category_category',
+        'dynamo_table_name': 'Category',
+        'is_active': False,
+        'redis_save_list' : [{
+            'prefix': 'category:',
+            'key': 'rds_id', #RDS id
+            'assign': 'id' # Dynamo UUID
+        }],
+        'mark_migrate': False
+    }, {
+        'rds_query': {
+            'select': 'id, now() as created_at, id as category_id, language, title',
+            'from': """(
+                            select id, (regexp_split_to_array('hindi_title', '_')::varchar[])[1] as language,hindi_title as title from forum_category_category
+                            union
+                            select id, (regexp_split_to_array('tamil_title', '_')::varchar[])[1] as language,  tamil_title as title from forum_category_category
+                            union
+                            select id, (regexp_split_to_array('telgu_title', '_')::varchar[])[1] as language,  telgu_title as title from forum_category_category
+                            union
+                            select id, (regexp_split_to_array('bengali_title', '_')::varchar[])[1] as language,  bengali_title as title from forum_category_category
+                            union
+                            select id, (regexp_split_to_array('kannada_title', '_')::varchar[])[1] as language,  kannada_title as title from forum_category_category
+                            union
+                            select id, (regexp_split_to_array('gujrati_title', '_')::varchar[])[1] as language,  gujrati_title as title from forum_category_category
+                            union
+                            select id, (regexp_split_to_array('malayalam_title', '_')::varchar[])[1] as language,  malayalam_title as title from forum_category_category
+                            union
+                            select id, (regexp_split_to_array('marathi_title', '_')::varchar[])[1] as language,  marathi_title as title from forum_category_category
+                            union
+                            select id, (regexp_split_to_array('odia_title', '_')::varchar[])[1] as language,  odia_title as title from forum_category_category
+                            union
+                            select id, (regexp_split_to_array('punjabi_title', '_')::varchar[])[1] as language,  punjabi_title as title from forum_category_category) as A""",
+            'where': 'true',
+        },
+        'rds_table_name': 'forum_category_category',
+        'mark_migrate': False,
+        'dynamo_table_name': 'CategoryLanguage',
+        'redis_get_list': [{
+            'key': 'category_id',
+            'redis_key': 'category:%s'
+        }],
+        'is_active': False
+    }, {
+        'rds_query': {
+            'select': 'auth_user.id as user_id, forum_user_userprofile_sub_category.category_id',
+            'from': 'forum_user_userprofile_sub_category inner join forum_user_userprofile on forum_user_userprofile.id = forum_user_userprofile_sub_category.userprofile_id inner join auth_user on auth_user.id = forum_user_userprofile.user_id',
+            'where': 'true',
+            'limit': 2000
+        },
+        'rds_table_name': 'forum_user_userprofile_sub_category',
+        'dynamo_table_name': 'UserCategory',
+        'redis_get_list': [{
+            'key': 'category_id',
+            'redis_key': 'category:%s'
+        }, {
+            'key': 'user_id',
+            'redis_key': 'user:%s'
+        }],
+        'is_active': False
+    }, {
+        'rds_query': {
+            'select': 'id, id as rds_id, created_at, last_modified, is_active, duration_start_date, duration_end_date, bolo_score_earned, is_encashed, enchashed_on, is_eligible_for_encash, user_id, bolo_score_details, "equivalent_INR", encashable_cycle, is_expired',
+            'from': 'forum_payment_encashabledetail',
+            'where': 'true',
+            'limit': 2000
+        },
+        'rds_table_name': 'forum_payment_encashabledetail',
+        'dynamo_table_name': 'EncashableDetail',
+        'is_active': False,
+        'redis_get_list': [{
+            'key': 'user_id',
+            'redis_key': 'user:%s'
+        }]
+    }, {
+        'rds_query': {
+            'select': 'id , id as rds_id, user_id, title, created_at, last_modified, question_video, slug, language_id, question_image, is_popular, media_duration, is_removed, thumbnail, view_count, imp_count, comment_count, total_share_count, share_count, is_vb, likes_count, is_monetized, is_moderated, vb_width, vb_height, likes_count as video_like_count, total_share_count as video_share_count, is_thumbnail_resized, whatsapp_share_count, linkedin_share_count, facebook_share_count, twitter_share_count, backup_url, vb_playtime, vb_score, is_boosted, boosted_till, boosted_start_time, boosted_end_time, is_logo_checked, time_deleted, plag_text',
+            'from': 'forum_topic_topic',
+            'where': 'true',
+            'limit': 100
+        },
+        'rds_table_name': 'forum_topic_topic',
+        'dynamo_table_name': 'VideoByte',
+        'redis_save_list': [{
+            'prefix': 'video:',
+            'key': 'rds_id', #RDS id
+            'assign': 'id' # Dynamo UUID
+        }],
+        'redis_get_list': [{
+            'key': 'user_id',
+            'redis_key': 'user:%s'
+        }],
+        'is_active': True,
+        'elasticsearch': {
+            'keys': ['user_id', 'title', 'created_at', 'media_duration', 'thumbnail', 'language_id', 'views', 'is_moderated', 'is_monetized', 'is_popular'],
+            'index': 'video-byte-index'
+        }
     }]
 
 }

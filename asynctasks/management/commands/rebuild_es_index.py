@@ -24,7 +24,7 @@ ES_CONFIG = {
                 'number_of_shards': 2,
                 'number_of_replicas': 1
             },
-            'mapping': {
+            'mappings': {
                 'properties': {
                     'name': {'type': 'text'},
                     'username': {'type': 'keyword'},
@@ -36,6 +36,32 @@ ES_CONFIG = {
             }      
         },
     },{
+        'name': 'video-byte-index',
+        'table': 'VideoByte',
+        'index-config': {
+            'settings': {
+                'number_of_shards': 2,
+                'number_of_replicas': 1
+            },
+            'mappings': {
+                'properties': {
+                    'user_id': {'type': 'keyword'},
+                    'user_name': {'type': 'text', 'index': False},
+                    'title': {'type': 'text'},
+                    'created_at': {'type': 'date'},
+                    'score': {'type': 'float'},
+                    'media_duration': {'type': 'text', 'index': False},
+                    'thumbnail': {'type': 'text', 'index': False},
+                    'language_id': {'type': 'keyword'},
+                    'views': {'type': 'integer'},
+                    'is_moderated': {'type': 'boolean'},
+                    'is_monetized': {'type': 'boolean'},
+                    'is_popular': {'type': 'boolean'},
+                    'categories': {'type': 'keyword'}
+                }
+            }
+        } 
+    },{
         'name': 'vb-seen-index',
         'table': 'VBSeen',
         'index-config': {
@@ -43,7 +69,7 @@ ES_CONFIG = {
                 'number_of_shards': 2,
                 'number_of_replicas': 1
             },
-            'mapping': {
+            'mappings': {
                 'properties': {
                     'user_id': {'type': 'keyword'},
                     'video_id': {'type': 'keyword'},
@@ -59,7 +85,7 @@ ES_CONFIG = {
                 'number_of_shards': 2,
                 'number_of_replicas': 1
             },
-            'mapping': {
+            'mappings': {
                 'properties': {
                     'video_id': {'type': 'keyword'},
                     'view_count': {'type': 'integer'},
@@ -75,7 +101,7 @@ ES_CONFIG = {
                 'number_of_shards': 2,
                 'number_of_replicas': 1
             },
-            'mapping': {
+            'mappings': {
                 'properties': {
                     'user_id': {'type': 'keyword'},
                     'video_id': {'type': 'keyword'},
@@ -92,7 +118,7 @@ ES_CONFIG = {
                 'number_of_shards': 2,
                 'number_of_replicas': 1
             },
-            'mapping': {
+            'mappings': {
                 'properties': {
                     'hashtag': {'type': 'keyword'},
                     'hashtag_id': {'type': 'keyword'},
@@ -126,11 +152,28 @@ class Command(BaseCommand):
         return ret
 
 
+    def add_arguments(self, parser):
+        # Positional arguments
+        parser.add_argument('--index-list', nargs='+', type=str)
+
+        # Named (optional) arguments
+        parser.add_argument(
+            '--all',
+            action='store_true',
+            help='Reindex all',
+        )
+
+
     def handle(self, *args, **options):
-        for index in ES_CONFIG.get('indices'):
+        if options.get('all'):
+            index_list = ES_CONFIG.get('indices')
+        else:
+            index_list = filter(lambda x: x.get('name') in options.get('index_list')[0].split(','), 
+                                ES_CONFIG.get('indices'))
+
+        for index in index_list:
             self.recreate_index(index)
-        
-        
+
         
     def recreate_index(self, index):
         if self.es.indices.exists(index.get('name')):
@@ -138,7 +181,7 @@ class Command(BaseCommand):
             self.es.indices.delete(index=index.get('name'), ignore=[400, 404])
 
         print("===== Creating Index %s ..."%index.get('name'))
-        self.es.indices.create(index=index.get('name'), body=index.get('config'))
+        self.es.indices.create(index=index.get('name'), body=index.get('index-config'))
         print("===== Index %s created successfully."%index.get('name'))
         
 

@@ -28,7 +28,7 @@ ALLOWED_THREADS = 10
 
 
 redis_client.set('migration_threads', 0)
-lock = redis_client.lock('migration_lock')
+lock = redis_client.lock('migration_lock_5')
 
 
 class Command(BaseCommand):
@@ -71,7 +71,7 @@ class Command(BaseCommand):
         value_type = None
         _type = type(value)
 
-        if _type == datetime.datetime:
+        if _type in (datetime.datetime, datetime.date):
             value_type, value = 'S', str(value)
 
         elif _type == bytes:
@@ -87,12 +87,20 @@ class Command(BaseCommand):
         return { value_type: value }
 
 
-    def get_rds_query(self, query, start_index, end_index, rds_table_name):
-        return """
-            SELECT %s FROM %s 
-            WHERE %s AND is_migrated = false AND %s.id >= %s 
-                    AND %s.id <= %s LIMIT %s 
-        """%(query.get('select'), query.get('from'), query.get('where'), rds_table_name, start_index, rds_table_name, end_index, query.get('limit'))
+    def get_rds_query(self, query_info, start_index, end_index, rds_table_name, mark_migrate=True):
+        query = "SELECT %s FROM %s WHERE %s "
+        params = [query_info.get('select'), query_info.get('from'), query_info.get('where')]
+
+        if mark_migrate:
+            query += " AND is_migrated = false "
+
+        if query_info.get('limit'):
+            query += " AND  %s.id >= %s AND %s.id <= %s "
+            params += [rds_table_name, start_index, rds_table_name, end_index] 
+
+            query += " LIMIT %s "
+            params.append(query_info.get('limit'))
+        return query%tuple(params)
 
 
     def test(self):
@@ -107,13 +115,16 @@ class Command(BaseCommand):
             if not table_info.get('is_active'):
                 continue
 
-            lock.acquire(blocking=True)
-
-            self.check_for_migrate_column(_cr, table_info.get('rds_table_name'))
+            # global lock
+            # lock.acquire(blocking=True)
+            if table_info.get('mark_migrate', True):
+                self.check_for_migrate_column(_cr, table_info.get('rds_table_name'))
 
             dynamo_table = dynamo_client.describe_table(TableName=table_info.get('dynamo_table_name'))
             dynamo_table_key_attr = {i.get('AttributeName'): i.get('AttributeType') for i in dynamo_table.get('Table').get('AttributeDefinitions')}
 
+            print("dynamo_table_key_attr", dynamo_table_key_attr)
+            
             query = table_info.get('rds_query')
 
             _cr.execute(" select count(1) from %s where %s "%(table_info.get('rds_table_name'), 
@@ -131,15 +142,13 @@ class Command(BaseCommand):
                     table_info.get('rds_table_name'), table_info.get('rds_table_name'), query.get('where')))
             end_index = _cr.fetchall()[0][0]
 
-            if count < query.get('limit'):
+            if not query.get('limit') or count < query.get('limit'):
                 run_thread.delay("==", start_index, end_index, table_info, dynamo_table_key_attr)
             else:
                 segments_partition = list(range(start_index, end_index, int((end_index-start_index)/THREADS))) + [end_index]
                 
                 res = group(run_thread.s("%s ::"%i, segments_partition[i], segments_partition[i+1],
                     table_info, dynamo_table_key_attr) for i in range(0, len(segments_partition)-1))()
-
-            # lock.release()
 
 
         print("Total time = ", time() - t)
@@ -160,7 +169,7 @@ class Command(BaseCommand):
         t = time()
 
         while True:
-            query = self.get_rds_query(table_info.get('rds_query'), start_index, end_index, table_info.get('rds_table_name'))
+            query = self.get_rds_query(table_info.get('rds_query'), start_index, end_index, table_info.get('rds_table_name'), table_info.get('mark_migrate', True))
 
             _cr.execute(query)
             columns_list = [d.name for d in _cr.description]
@@ -173,6 +182,13 @@ class Command(BaseCommand):
 
             for row in _cr.fetchall():
                 row_data = dict(zip(columns_list, row))
+
+                missing_key_attrs = [key for key in dynamo_table_key_attr
+                                        if key not in columns_list or row_data.get(key) in (None, '') ]
+
+                print(" missing_key_attrs ", missing_key_attrs)
+
+
                 dynamo_item = self.get_formatted_item(row_data, dynamo_table_key_attr, 
                                     table_info.get('redis_get_list', []))
                 dynamo_item_list.append(dynamo_item)
@@ -200,17 +216,23 @@ class Command(BaseCommand):
             if not is_data_processed:
                 break
 
-            ESCommand().bulk_insert_doc(es_doc_list, table_info.get('elasticsearch').get('index'))
+            self.migrate_by_threading(dynamo_item_list, table_info)
+
+            if redis_items:
+                redis_client.mset(redis_items)
 
 
-            # self.migrate_by_threading(dynamo_item_list, table_info)
+            if table_info.get('elasticsearch'):
+                ESCommand().bulk_insert_doc(es_doc_list, table_info.get('elasticsearch').get('index'))
+            
+            if table_info.get('mark_migrate', True):
+                _cr.execute("UPDATE " + table_info.get('rds_table_name') + " SET is_migrated = true WHERE id in %s", 
+                    [tuple(migrated_ids)])
+            else:
+                break
 
-            # if redis_items:
-            #     redis_client.mset(redis_items)
-
-            # _cr.execute("UPDATE " + table_info.get('rds_table_name') + " SET is_migrated = true WHERE id in %s", 
-            #     [tuple(migrated_ids)])
             break
+
 
         print(" time = %s"%(time() - t))
 
@@ -222,7 +244,7 @@ class Command(BaseCommand):
         if len(dynamo_item_list) <= BATCH_SIZE:
             thread = threading.Thread(target=run_dynamo_batch_write_thread, 
                         args=(table_info.get('dynamo_table_name'), 
-                    dynamo_item_list, table_info.get('rds_table_name')))
+                    dynamo_item_list, table_info.get('rds_table_name'), table_info.get('mark_migrate')))
             thread.start()
 
         else:
@@ -231,7 +253,7 @@ class Command(BaseCommand):
                 thread = threading.Thread(target=run_dynamo_batch_write_thread, 
                         args=(table_info.get('dynamo_table_name'), 
                             dynamo_item_list[index_list[i]: index_list[i+1]], 
-                            table_info.get('rds_table_name')))
+                            table_info.get('rds_table_name'), table_info.get('mark_migrate')))
 
                 while int(redis_client.get('migration_threads').decode()) >= ALLOWED_THREADS:
                     print(" threads =", redis_client.get('migration_threads'))
@@ -277,10 +299,12 @@ def run_thread(*args):
 
 
 @app.task
-def run_dynamo_batch_write_thread(dynamo_table_name, item_list, rds_table_name):
+def run_dynamo_batch_write_thread(dynamo_table_name, item_list, rds_table_name, mark_migrate=True):
     start_index = 0
     end_index = DYNAMO_BATCH_SIZE
     item_list_length = len(item_list)
+
+    print(item_list[0])
 
     while start_index < item_list_length:
         dynamo_request_data = {"RequestItems": {dynamo_table_name: item_list[start_index: end_index]}}
@@ -289,11 +313,12 @@ def run_dynamo_batch_write_thread(dynamo_table_name, item_list, rds_table_name):
             dynamo_client.batch_write_item(**dynamo_request_data)
         except Exception as e:
             print(e)
-            migrated_ids = [item.get('PutRequest').get('Item').get('rds_id').get('N')  for item in item_list[start_index: end_index]]
+            if mark_migrate:
+                migrated_ids = [item.get('PutRequest').get('Item').get('rds_id').get('N')  for item in item_list[start_index: end_index]]
 
-            print(" migrated_ids ", migrated_ids)
-            cr = get_rds_cursor()
-            cr.execute("UPDATE " + rds_table_name + " SET is_migrated = false WHERE id in %s and is_migrated = true ", [tuple(migrated_ids)])
+                print(" migrated_ids ", migrated_ids)
+                cr = get_rds_cursor()
+                cr.execute("UPDATE " + rds_table_name + " SET is_migrated = false WHERE id in %s and is_migrated = true ", [tuple(migrated_ids)])
 
         start_index, end_index = end_index, end_index + DYNAMO_BATCH_SIZE
 
@@ -302,6 +327,8 @@ def run_dynamo_batch_write_thread(dynamo_table_name, item_list, rds_table_name):
     running_threads = int(redis_client.get('migration_threads').decode())
 
     if running_threads <= 1:
-        lock.release()
+        global lock
+        pass
+        # lock.release()
     else:
         redis_client.set('migration_threads', running_threads - 1)
